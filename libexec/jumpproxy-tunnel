@@ -2,8 +2,8 @@
 
 set -u
 
-if test "$#" -ne 4; then
-    /bin/echo "jumpproxy-tunnel: expected HOST USER REMOTE_PORT LOCAL_PORT" >&2
+if test "$#" -ne 5; then
+    /bin/echo "jumpproxy-tunnel: expected HOST USER REMOTE_PORT LOCAL_PORT SSH_CONFIG" >&2
     exit 2
 fi
 
@@ -11,67 +11,31 @@ SSH_HOST="$1"
 SSH_USER="$2"
 REMOTE_PORT="$3"
 LOCAL_PORT="$4"
+SSH_CONFIG="$5"
 
-find_cloudflared() {
-    if test -n "${CLOUDFLARED_BIN:-}" && test -x "$CLOUDFLARED_BIN"; then
-        /usr/bin/printf '%s\n' "$CLOUDFLARED_BIN"
-        return 0
-    fi
-    for candidate in \
-        /opt/homebrew/bin/cloudflared \
-        /usr/local/bin/cloudflared \
-        "$HOME/.local/bin/cloudflared" \
-        /usr/bin/cloudflared
-    do
-        if test -x "$candidate"; then
-            /usr/bin/printf '%s\n' "$candidate"
-            return 0
-        fi
-    done
-    /bin/echo "cloudflared was not found; install it before enabling jumpproxy" >&2
-    return 127
-}
-
-find_identity() {
-    for candidate in "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519"; do
-        if test -r "$candidate"; then
-            /usr/bin/printf '%s\n' "$candidate"
-            return 0
-        fi
-    done
-    return 1
-}
-
-CLOUDFLARED=$(find_cloudflared) || exit $?
-IDENTITY=$(find_identity || true)
-
-if test -n "$IDENTITY"; then
-    exec /usr/bin/ssh \
-        -F /dev/null \
-        -N \
-        -T \
-        -o BatchMode=yes \
-        -o ExitOnForwardFailure=yes \
-        -o ServerAliveInterval=15 \
-        -o ServerAliveCountMax=2 \
-        -o ConnectTimeout=20 \
-        -o StrictHostKeyChecking=accept-new \
-        -o "IdentityFile=$IDENTITY" \
-        -o "ProxyCommand=$CLOUDFLARED access ssh --hostname %h" \
-        -R "127.0.0.1:$REMOTE_PORT:127.0.0.1:$LOCAL_PORT" \
-        "$SSH_USER@$SSH_HOST"
-else
-    exec /usr/bin/ssh \
-        -F /dev/null \
-        -N \
-        -T \
-        -o BatchMode=yes \
-        -o ExitOnForwardFailure=yes \
-        -o ServerAliveInterval=15 \
-        -o ServerAliveCountMax=2 \
-        -o ConnectTimeout=20 \
-        -o StrictHostKeyChecking=accept-new \
-        -o "ProxyCommand=$CLOUDFLARED access ssh --hostname %h" \
-        -R "127.0.0.1:$REMOTE_PORT:127.0.0.1:$LOCAL_PORT" \
-        "$SSH_USER@$SSH_HOST"
+if test ! -r "$SSH_CONFIG"; then
+    /bin/echo "SSH config is not readable: $SSH_CONFIG" >&2
+    exit 2
 fi
+
+if test -n "$SSH_USER"; then
+    TARGET="$SSH_USER@$SSH_HOST"
+else
+    TARGET="$SSH_HOST"
+fi
+
+# HostName, User, Port, IdentityFile, ProxyJump, and ProxyCommand are resolved
+# exclusively by the selected SSH config. cloudflared is not a dependency of
+# this service; it is only used when the SSH config itself requests it.
+exec /usr/bin/ssh \
+    -F "$SSH_CONFIG" \
+    -N \
+    -T \
+    -o BatchMode=yes \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=2 \
+    -o ConnectTimeout=20 \
+    -o StrictHostKeyChecking=accept-new \
+    -R "127.0.0.1:$REMOTE_PORT:127.0.0.1:$LOCAL_PORT" \
+    "$TARGET"

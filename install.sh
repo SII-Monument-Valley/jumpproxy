@@ -31,12 +31,17 @@ done
 
 if test "${1:-}" != "--no-hosts" && test -r "$HOSTS_FILE"; then
     tab=$(/usr/bin/printf '\t')
-    while IFS="$tab" read -r host ssh_user remote_port local_port; do
+    while IFS="$tab" read -r host ssh_user remote_port local_port ssh_config; do
         case "$host" in ''|'#'*) continue ;; esac
-        "$COMMAND" add "$host" \
-            --user "$ssh_user" \
-            --remote-port "$remote_port" \
-            --local-port "$local_port"
+        if test "$ssh_user" = "-" && { test -z "$ssh_config" || test "$ssh_config" = "-"; }; then
+            "$COMMAND" add "$host" --remote-port "$remote_port" --local-port "$local_port"
+        elif test "$ssh_user" = "-"; then
+            "$COMMAND" add "$host" --remote-port "$remote_port" --local-port "$local_port" --ssh-config "$ssh_config"
+        elif test -z "$ssh_config" || test "$ssh_config" = "-"; then
+            "$COMMAND" add "$host" --user "$ssh_user" --remote-port "$remote_port" --local-port "$local_port"
+        else
+            "$COMMAND" add "$host" --user "$ssh_user" --remote-port "$remote_port" --local-port "$local_port" --ssh-config "$ssh_config"
+        fi
     done < "$HOSTS_FILE"
 fi
 

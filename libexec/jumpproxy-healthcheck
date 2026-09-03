@@ -5,41 +5,13 @@ set -u
 DOMAIN="gui/$(/usr/bin/id -u)"
 CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/jumpproxy"
 HOST_DIR="$CONFIG_ROOT/hosts"
+DEFAULTS_FILE="$CONFIG_ROOT/defaults.conf"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/jumpproxy"
 
 /bin/mkdir -p "$STATE_DIR"
 
 log() {
     /bin/echo "$(/bin/date '+%Y-%m-%d %H:%M:%S') $*"
-}
-
-find_cloudflared() {
-    if test -n "${CLOUDFLARED_BIN:-}" && test -x "$CLOUDFLARED_BIN"; then
-        /usr/bin/printf '%s\n' "$CLOUDFLARED_BIN"
-        return 0
-    fi
-    for candidate in \
-        /opt/homebrew/bin/cloudflared \
-        /usr/local/bin/cloudflared \
-        "$HOME/.local/bin/cloudflared" \
-        /usr/bin/cloudflared
-    do
-        if test -x "$candidate"; then
-            /usr/bin/printf '%s\n' "$candidate"
-            return 0
-        fi
-    done
-    return 127
-}
-
-find_identity() {
-    for candidate in "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ed25519"; do
-        if test -r "$candidate"; then
-            /usr/bin/printf '%s\n' "$candidate"
-            return 0
-        fi
-    done
-    return 1
 }
 
 is_disabled() {
@@ -89,39 +61,25 @@ record_failure() {
 }
 
 run_remote_check() {
-    proxy_command="ProxyCommand=$CLOUDFLARED access ssh --hostname %h"
     remote_command="curl -fsS --connect-timeout 5 --max-time 10 -o /dev/null --proxy http://127.0.0.1:$REMOTE_PORT https://example.com/"
-
-    if test -n "$IDENTITY"; then
-        /usr/bin/ssh \
-            -F /dev/null \
-            -T \
-            -o BatchMode=yes \
-            -o ConnectionAttempts=1 \
-            -o ConnectTimeout=15 \
-            -o ServerAliveInterval=5 \
-            -o ServerAliveCountMax=1 \
-            -o StrictHostKeyChecking=accept-new \
-            -o "IdentityFile=$IDENTITY" \
-            -o "$proxy_command" \
-            "$SSH_USER@$SSH_HOST" \
-            "$remote_command" \
-            >/dev/null 2>&1
+    if test -n "$SSH_USER"; then
+        target="$SSH_USER@$SSH_HOST"
     else
-        /usr/bin/ssh \
-            -F /dev/null \
-            -T \
-            -o BatchMode=yes \
-            -o ConnectionAttempts=1 \
-            -o ConnectTimeout=15 \
-            -o ServerAliveInterval=5 \
-            -o ServerAliveCountMax=1 \
-            -o StrictHostKeyChecking=accept-new \
-            -o "$proxy_command" \
-            "$SSH_USER@$SSH_HOST" \
-            "$remote_command" \
-            >/dev/null 2>&1
+        target="$SSH_HOST"
     fi
+
+    /usr/bin/ssh \
+        -F "$SSH_CONFIG" \
+        -T \
+        -o BatchMode=yes \
+        -o ConnectionAttempts=1 \
+        -o ConnectTimeout=15 \
+        -o ServerAliveInterval=5 \
+        -o ServerAliveCountMax=1 \
+        -o StrictHostKeyChecking=accept-new \
+        "$target" \
+        "$remote_command" \
+        >/dev/null 2>&1
 }
 
 check_proxy() {
@@ -130,10 +88,22 @@ check_proxy() {
     SSH_USER=""
     REMOTE_PORT=""
     LOCAL_PORT=""
+    SSH_CONFIG=""
     . "$config"
+    if test -z "$SSH_CONFIG"; then
+        DEFAULT_SSH_CONFIG="$HOME/.ssh/config"
+        if test -r "$DEFAULTS_FILE"; then
+            . "$DEFAULTS_FILE"
+        fi
+        SSH_CONFIG="$DEFAULT_SSH_CONFIG"
+    fi
     label="com.jumpproxy.tunnel.$SSH_HOST"
 
     if is_disabled "$label"; then
+        return 0
+    fi
+    if test ! -r "$SSH_CONFIG"; then
+        log "$SSH_HOST: SSH config is not readable: $SSH_CONFIG"
         return 0
     fi
     if ! /usr/bin/nc -z -w 2 127.0.0.1 "$LOCAL_PORT" >/dev/null 2>&1; then
@@ -163,12 +133,6 @@ check_proxy() {
         reset_failures "$label"
     fi
 }
-
-CLOUDFLARED=$(find_cloudflared) || {
-    log "cloudflared was not found"
-    exit 127
-}
-IDENTITY=$(find_identity || true)
 
 for config in "$HOST_DIR"/*.conf; do
     test -e "$config" || continue

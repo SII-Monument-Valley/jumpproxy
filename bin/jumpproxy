@@ -16,14 +16,15 @@ HEALTHCHECK_LABEL="com.jumpproxy.healthcheck"
 HEALTHCHECK_PLIST="$AGENT_DIR/$HEALTHCHECK_LABEL.plist"
 BUILTIN_REMOTE_PORT="1080"
 BUILTIN_LOCAL_PORT="7897"
+BUILTIN_SSH_CONFIG="$HOME/.ssh/config"
 
 show_general_help() {
     /bin/cat <<'EOF'
 Usage:
-  jumpproxy add HOST [--user USER] [--remote-port PORT] [--local-port PORT]
-  jumpproxy modify HOST [--user USER] [--remote-port PORT] [--local-port PORT]
+  jumpproxy add HOST [--user USER] [--remote-port PORT] [--local-port PORT] [--ssh-config FILE]
+  jumpproxy modify HOST [--user USER] [--remote-port PORT] [--local-port PORT] [--ssh-config FILE]
   jumpproxy remove HOST
-  jumpproxy defaults [--remote-port PORT] [--local-port PORT]
+  jumpproxy defaults [--remote-port PORT] [--local-port PORT] [--ssh-config FILE]
   jumpproxy defaults --reset
   jumpproxy enable|disable|restart [HOST]
   jumpproxy on|off
@@ -35,7 +36,7 @@ Commands:
   add          Register a host and connect immediately.
   modify       Change an existing host and reconnect it (alias: update).
   remove       Stop and delete a registered host (aliases: delete, rm).
-  defaults     View or change default remote/local ports.
+  defaults     View or change default ports and SSH config file.
   enable       Enable all hosts, or one specified host.
   disable      Disable all hosts, or one specified host.
   restart      Restart all hosts, or one specified host.
@@ -55,11 +56,13 @@ Usage: jumpproxy add HOST [OPTIONS]
 Register HOST, create its LaunchAgent, and connect immediately.
 
 Options:
-  --user USER          SSH user (default: root)
+  --user USER          Override the User from SSH config (use "-" to clear)
   --remote-port PORT   Port opened on the remote server
   --local-port PORT    Local proxy port forwarded to the server
+  --ssh-config FILE    SSH config for this host
 
-Omitted ports come from "jumpproxy defaults".
+The SSH user is normally read from the selected SSH config. Omitted ports and
+SSH config file come from "jumpproxy defaults".
 EOF
             ;;
         modify|update)
@@ -73,25 +76,27 @@ Options:
   --user USER
   --remote-port PORT
   --local-port PORT
+  --ssh-config FILE
 EOF
             ;;
         defaults)
             /bin/cat <<'EOF'
 Usage:
   jumpproxy defaults
-  jumpproxy defaults [--remote-port PORT] [--local-port PORT]
+  jumpproxy defaults [--remote-port PORT] [--local-port PORT] [--ssh-config FILE]
   jumpproxy defaults --reset
 
-With no options, print the current defaults. Changes apply to future "add"
-commands whose corresponding port option is omitted. Existing hosts are not
-changed; use "jumpproxy modify HOST" for those.
+With no options, print the current defaults. The default SSH config is
+~/.ssh/config. Changes apply to future "add" commands whose corresponding
+option is omitted. Existing hosts are not changed; use
+"jumpproxy modify HOST" for those.
 EOF
             ;;
         remove|delete|rm)
             /bin/cat <<'EOF'
 Usage: jumpproxy remove HOST
 
-Disable HOST, terminate its managed SSH/cloudflared process tree, and remove
+Disable HOST, terminate its managed SSH process tree, and remove
 its LaunchAgent and registration.
 EOF
             ;;
@@ -120,35 +125,41 @@ ensure_dirs() {
 write_defaults() {
     default_remote_port="$1"
     default_local_port="$2"
+    default_ssh_config="$3"
     temp_defaults=$(/usr/bin/mktemp "$CONFIG_ROOT/.defaults.XXXXXX")
     /bin/chmod 600 "$temp_defaults"
     {
         /usr/bin/printf "DEFAULT_REMOTE_PORT='%s'\n" "$default_remote_port"
         /usr/bin/printf "DEFAULT_LOCAL_PORT='%s'\n" "$default_local_port"
+        /usr/bin/printf "DEFAULT_SSH_CONFIG='%s'\n" "$default_ssh_config"
     } > "$temp_defaults"
     /bin/mv -f "$temp_defaults" "$DEFAULTS_FILE"
 }
 
 ensure_defaults() {
     if test ! -r "$DEFAULTS_FILE"; then
-        write_defaults "$BUILTIN_REMOTE_PORT" "$BUILTIN_LOCAL_PORT"
+        write_defaults "$BUILTIN_REMOTE_PORT" "$BUILTIN_LOCAL_PORT" "$BUILTIN_SSH_CONFIG"
     fi
 }
 
 load_defaults() {
     DEFAULT_REMOTE_PORT="$BUILTIN_REMOTE_PORT"
     DEFAULT_LOCAL_PORT="$BUILTIN_LOCAL_PORT"
+    DEFAULT_SSH_CONFIG="$BUILTIN_SSH_CONFIG"
     if test -r "$DEFAULTS_FILE"; then
         . "$DEFAULTS_FILE"
     fi
     validate_port "$DEFAULT_REMOTE_PORT"
     validate_port "$DEFAULT_LOCAL_PORT"
+    DEFAULT_SSH_CONFIG=$(normalize_config_path "$DEFAULT_SSH_CONFIG")
+    validate_config_path "$DEFAULT_SSH_CONFIG"
 }
 
 configure_defaults() {
     load_defaults
     if test "$#" -eq 0; then
-        /usr/bin/printf 'remote_port=%s\nlocal_port=%s\n' "$DEFAULT_REMOTE_PORT" "$DEFAULT_LOCAL_PORT"
+        /usr/bin/printf 'remote_port=%s\nlocal_port=%s\nssh_config=%s\n' \
+            "$DEFAULT_REMOTE_PORT" "$DEFAULT_LOCAL_PORT" "$DEFAULT_SSH_CONFIG"
         return 0
     fi
 
@@ -162,10 +173,15 @@ configure_defaults() {
                 test "$#" -ge 2 || { /bin/echo "--local-port requires a value" >&2; return 2; }
                 DEFAULT_LOCAL_PORT="$2"; shift 2
                 ;;
+            --ssh-config)
+                test "$#" -ge 2 || { /bin/echo "--ssh-config requires a value" >&2; return 2; }
+                DEFAULT_SSH_CONFIG=$(normalize_config_path "$2"); shift 2
+                ;;
             --reset)
                 test "$#" -eq 1 || { /bin/echo "--reset cannot be combined with other options" >&2; return 2; }
                 DEFAULT_REMOTE_PORT="$BUILTIN_REMOTE_PORT"
                 DEFAULT_LOCAL_PORT="$BUILTIN_LOCAL_PORT"
+                DEFAULT_SSH_CONFIG="$BUILTIN_SSH_CONFIG"
                 shift
                 ;;
             -h|--help)
@@ -181,9 +197,44 @@ configure_defaults() {
 
     validate_port "$DEFAULT_REMOTE_PORT"
     validate_port "$DEFAULT_LOCAL_PORT"
-    write_defaults "$DEFAULT_REMOTE_PORT" "$DEFAULT_LOCAL_PORT"
-    /usr/bin/printf 'defaults updated: remote_port=%s local_port=%s\n' \
-        "$DEFAULT_REMOTE_PORT" "$DEFAULT_LOCAL_PORT"
+    require_config_file "$DEFAULT_SSH_CONFIG"
+    write_defaults "$DEFAULT_REMOTE_PORT" "$DEFAULT_LOCAL_PORT" "$DEFAULT_SSH_CONFIG"
+    /usr/bin/printf 'defaults updated: remote_port=%s local_port=%s ssh_config=%s\n' \
+        "$DEFAULT_REMOTE_PORT" "$DEFAULT_LOCAL_PORT" "$DEFAULT_SSH_CONFIG"
+}
+
+normalize_config_path() {
+    case "$1" in
+        '~')
+            /usr/bin/printf '%s' "$HOME"
+            ;;
+        '~/'*)
+            /usr/bin/printf '%s/%s' "$HOME" "${1#??}"
+            ;;
+        /*)
+            /usr/bin/printf '%s' "$1"
+            ;;
+        *)
+            /usr/bin/printf '%s/%s' "$PWD" "$1"
+            ;;
+    esac
+}
+
+validate_config_path() {
+    case "$1" in
+        ''|*"'"*)
+            /bin/echo "invalid SSH config path: $1" >&2
+            return 1
+            ;;
+    esac
+}
+
+require_config_file() {
+    validate_config_path "$1" || return 1
+    if test ! -r "$1"; then
+        /bin/echo "SSH config is not readable: $1" >&2
+        return 1
+    fi
 }
 
 normalize_host() {
@@ -201,7 +252,7 @@ validate_host() {
 
 validate_user() {
     case "$1" in
-        ''|*[!A-Za-z0-9._-]*)
+        *[!A-Za-z0-9._-]*)
             /bin/echo "invalid SSH user: $1" >&2
             return 1
             ;;
@@ -237,7 +288,6 @@ xml_escape() {
     /usr/bin/printf '%s' "$1" | /usr/bin/sed \
         -e 's/&/\&amp;/g' \
         -e 's/</\&lt;/g' \
-        -e 's/>/\&gt;/g' \
         -e 's/"/\&quot;/g' \
         -e "s/'/\&apos;/g"
 }
@@ -327,6 +377,7 @@ write_host_config() {
     ssh_user="$2"
     remote_port="$3"
     local_port="$4"
+    ssh_config="$5"
     config=$(config_for_host "$host")
     temp_config=$(/usr/bin/mktemp "$HOST_DIR/.host.XXXXXX")
     /bin/chmod 600 "$temp_config"
@@ -335,6 +386,7 @@ write_host_config() {
         /usr/bin/printf "SSH_USER='%s'\n" "$ssh_user"
         /usr/bin/printf "REMOTE_PORT='%s'\n" "$remote_port"
         /usr/bin/printf "LOCAL_PORT='%s'\n" "$local_port"
+        /usr/bin/printf "SSH_CONFIG='%s'\n" "$ssh_config"
     } > "$temp_config"
     /bin/mv -f "$temp_config" "$config"
 }
@@ -351,12 +403,19 @@ load_host_config() {
     SSH_USER=""
     REMOTE_PORT=""
     LOCAL_PORT=""
+    SSH_CONFIG=""
     # Files are created by write_host_config after strict value validation.
     . "$config"
     validate_host "$SSH_HOST"
     validate_user "$SSH_USER"
     validate_port "$REMOTE_PORT"
     validate_port "$LOCAL_PORT"
+    if test -z "$SSH_CONFIG"; then
+        load_defaults
+        SSH_CONFIG="$DEFAULT_SSH_CONFIG"
+    fi
+    SSH_CONFIG=$(normalize_config_path "$SSH_CONFIG")
+    validate_config_path "$SSH_CONFIG"
     if test "$SSH_HOST" != "$requested_host"; then
         /bin/echo "hostname mismatch in $config" >&2
         return 1
@@ -368,12 +427,14 @@ write_tunnel_plist() {
     ssh_user="$2"
     remote_port="$3"
     local_port="$4"
+    ssh_config="$5"
     label=$(label_for_host "$host")
     plist=$(plist_for_host "$host")
     temp_plist=$(/usr/bin/mktemp "$AGENT_DIR/.jumpproxy.XXXXXX")
     runner_xml=$(xml_escape "$TUNNEL_RUNNER")
     log_xml=$(xml_escape "$LOG_DIR/$host.log")
     error_log_xml=$(xml_escape "$LOG_DIR/$host.err.log")
+    ssh_config_xml=$(xml_escape "$ssh_config")
 
     /bin/cat > "$temp_plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -389,6 +450,7 @@ write_tunnel_plist() {
         <string>$ssh_user</string>
         <string>$remote_port</string>
         <string>$local_port</string>
+        <string>$ssh_config_xml</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -471,15 +533,17 @@ add_host() {
     host=$(normalize_host "$1")
     shift
     load_defaults
-    ssh_user="root"
+    ssh_user=""
     remote_port="$DEFAULT_REMOTE_PORT"
     local_port="$DEFAULT_LOCAL_PORT"
+    ssh_config="$DEFAULT_SSH_CONFIG"
 
     while test "$#" -gt 0; do
         case "$1" in
             --user)
                 test "$#" -ge 2 || { /bin/echo "--user requires a value" >&2; return 2; }
-                ssh_user="$2"; shift 2
+                if test "$2" = "-"; then ssh_user=""; else ssh_user="$2"; fi
+                shift 2
                 ;;
             --remote-port)
                 test "$#" -ge 2 || { /bin/echo "--remote-port requires a value" >&2; return 2; }
@@ -488,6 +552,10 @@ add_host() {
             --local-port)
                 test "$#" -ge 2 || { /bin/echo "--local-port requires a value" >&2; return 2; }
                 local_port="$2"; shift 2
+                ;;
+            --ssh-config)
+                test "$#" -ge 2 || { /bin/echo "--ssh-config requires a value" >&2; return 2; }
+                ssh_config=$(normalize_config_path "$2"); shift 2
                 ;;
             -h|--help)
                 show_help add
@@ -504,6 +572,7 @@ add_host() {
     validate_user "$ssh_user"
     validate_port "$remote_port"
     validate_port "$local_port"
+    require_config_file "$ssh_config"
     ensure_dirs
 
     label=$(label_for_host "$host")
@@ -511,11 +580,12 @@ add_host() {
     if is_loaded "$label"; then
         terminate_job "$label"
     fi
-    write_host_config "$host" "$ssh_user" "$remote_port" "$local_port"
-    write_tunnel_plist "$host" "$ssh_user" "$remote_port" "$local_port"
+    write_host_config "$host" "$ssh_user" "$remote_port" "$local_port" "$ssh_config"
+    write_tunnel_plist "$host" "$ssh_user" "$remote_port" "$local_port" "$ssh_config"
     enable_job "$label" "$plist"
     enable_healthcheck
-    /bin/echo "added and connecting: $ssh_user@$host (remote $remote_port -> local $local_port)"
+    if test -n "$ssh_user"; then target="$ssh_user@$host"; else target="$host"; fi
+    /bin/echo "added and connecting: $target via $ssh_config (remote $remote_port -> local $local_port)"
 }
 
 modify_host() {
@@ -530,12 +600,14 @@ modify_host() {
     ssh_user="$SSH_USER"
     remote_port="$REMOTE_PORT"
     local_port="$LOCAL_PORT"
+    ssh_config="$SSH_CONFIG"
 
     while test "$#" -gt 0; do
         case "$1" in
             --user)
                 test "$#" -ge 2 || { /bin/echo "--user requires a value" >&2; return 2; }
-                ssh_user="$2"; shift 2
+                if test "$2" = "-"; then ssh_user=""; else ssh_user="$2"; fi
+                shift 2
                 ;;
             --remote-port)
                 test "$#" -ge 2 || { /bin/echo "--remote-port requires a value" >&2; return 2; }
@@ -544,6 +616,10 @@ modify_host() {
             --local-port)
                 test "$#" -ge 2 || { /bin/echo "--local-port requires a value" >&2; return 2; }
                 local_port="$2"; shift 2
+                ;;
+            --ssh-config)
+                test "$#" -ge 2 || { /bin/echo "--ssh-config requires a value" >&2; return 2; }
+                ssh_config=$(normalize_config_path "$2"); shift 2
                 ;;
             -h|--help)
                 show_help modify
@@ -559,14 +635,16 @@ modify_host() {
     validate_user "$ssh_user"
     validate_port "$remote_port"
     validate_port "$local_port"
+    require_config_file "$ssh_config"
     label=$(label_for_host "$host")
     plist=$(plist_for_host "$host")
     terminate_job "$label"
-    write_host_config "$host" "$ssh_user" "$remote_port" "$local_port"
-    write_tunnel_plist "$host" "$ssh_user" "$remote_port" "$local_port"
+    write_host_config "$host" "$ssh_user" "$remote_port" "$local_port" "$ssh_config"
+    write_tunnel_plist "$host" "$ssh_user" "$remote_port" "$local_port" "$ssh_config"
     enable_job "$label" "$plist"
     enable_healthcheck
-    /bin/echo "updated and reconnecting: $ssh_user@$host (remote $remote_port -> local $local_port)"
+    if test -n "$ssh_user"; then target="$ssh_user@$host"; else target="$host"; fi
+    /bin/echo "updated and reconnecting: $target via $ssh_config (remote $remote_port -> local $local_port)"
 }
 
 remove_host() {
@@ -587,10 +665,15 @@ enable_host() {
     host=$(normalize_host "$1")
     validate_host "$host"
     load_host_config "$host"
+    require_config_file "$SSH_CONFIG"
     plist=$(plist_for_host "$host")
-    if test ! -r "$plist"; then
-        write_tunnel_plist "$SSH_HOST" "$SSH_USER" "$REMOTE_PORT" "$LOCAL_PORT"
+    if is_loaded "$(label_for_host "$host")"; then
+        terminate_job "$(label_for_host "$host")"
     fi
+    # Rewriting on every enable upgrades old registry/plist formats and makes
+    # changes to the selected SSH config effective immediately.
+    write_host_config "$SSH_HOST" "$SSH_USER" "$REMOTE_PORT" "$LOCAL_PORT" "$SSH_CONFIG"
+    write_tunnel_plist "$SSH_HOST" "$SSH_USER" "$REMOTE_PORT" "$LOCAL_PORT" "$SSH_CONFIG"
     enable_job "$(label_for_host "$host")" "$plist"
     /bin/echo "enabled and connecting: $host"
 }
@@ -652,8 +735,9 @@ status_host() {
     else
         local_state="unavailable"
     fi
-    /usr/bin/printf '%s: %s@%s, remote %s -> local %s (%s)\n' \
-        "$host" "$SSH_USER" "$SSH_HOST" "$REMOTE_PORT" "$LOCAL_PORT" "$local_state"
+    if test -n "$SSH_USER"; then target="$SSH_USER@$SSH_HOST"; else target="$SSH_HOST"; fi
+    /usr/bin/printf '%s: %s via %s, remote %s -> local %s (%s)\n' \
+        "$host" "$target" "$SSH_CONFIG" "$REMOTE_PORT" "$LOCAL_PORT" "$local_state"
     status_job "$(label_for_host "$host")"
 }
 
@@ -669,10 +753,12 @@ show_status() {
 }
 
 list_hosts() {
-    /usr/bin/printf '%-38s %-12s %-12s %-10s\n' "HOST" "USER" "REMOTE_PORT" "LOCAL_PORT"
+    /usr/bin/printf '%-38s %-14s %-12s %-10s %s\n' "HOST" "USER" "REMOTE_PORT" "LOCAL_PORT" "SSH_CONFIG"
     for host in $(registered_hosts); do
         load_host_config "$host" || continue
-        /usr/bin/printf '%-38s %-12s %-12s %-10s\n' "$SSH_HOST" "$SSH_USER" "$REMOTE_PORT" "$LOCAL_PORT"
+        if test -n "$SSH_USER"; then display_user="$SSH_USER"; else display_user="(from config)"; fi
+        /usr/bin/printf '%-38s %-14s %-12s %-10s %s\n' \
+            "$SSH_HOST" "$display_user" "$REMOTE_PORT" "$LOCAL_PORT" "$SSH_CONFIG"
     done
 }
 

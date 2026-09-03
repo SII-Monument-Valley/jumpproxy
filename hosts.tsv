@@ -1,5 +1,6 @@
-# host	user	remote_port	local_port
-gateway.sii.sh.cn	root	1080	7897
-ssh.deeptoken.site	root	1080	7897
-swq.sii.sh.cn	root	1080	7897
-worldmodel-gateway.sii.sh.cn	root	1080	7897
+# host	user	remote_port	local_port	ssh_config
+# Use "-" for user or ssh_config to inherit from the selected defaults/config.
+gateway.sii.sh.cn	-	1080	7897	-
+ssh.deeptoken.site	-	1080	7897	-
+swq.sii.sh.cn	-	1080	7897	-
+worldmodel-gateway.sii.sh.cn	-	1080	7897	-
