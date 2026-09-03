@@ -1,0 +1,770 @@
+#!/bin/sh
+
+set -u
+
+DOMAIN="gui/$(/usr/bin/id -u)"
+AGENT_DIR="$HOME/Library/LaunchAgents"
+INSTALL_ROOT="$HOME/.local/lib/jumpproxy"
+CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/jumpproxy"
+HOST_DIR="$CONFIG_ROOT/hosts"
+DEFAULTS_FILE="$CONFIG_ROOT/defaults.conf"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/jumpproxy"
+LOG_DIR="$HOME/Library/Logs/jumpproxy"
+TUNNEL_RUNNER="$INSTALL_ROOT/jumpproxy-tunnel"
+HEALTHCHECK_RUNNER="$INSTALL_ROOT/jumpproxy-healthcheck"
+HEALTHCHECK_LABEL="com.jumpproxy.healthcheck"
+HEALTHCHECK_PLIST="$AGENT_DIR/$HEALTHCHECK_LABEL.plist"
+BUILTIN_REMOTE_PORT="1080"
+BUILTIN_LOCAL_PORT="7897"
+
+show_general_help() {
+    /bin/cat <<'EOF'
+Usage:
+  jumpproxy add HOST [--user USER] [--remote-port PORT] [--local-port PORT]
+  jumpproxy modify HOST [--user USER] [--remote-port PORT] [--local-port PORT]
+  jumpproxy remove HOST
+  jumpproxy defaults [--remote-port PORT] [--local-port PORT]
+  jumpproxy defaults --reset
+  jumpproxy enable|disable|restart [HOST]
+  jumpproxy on|off
+  jumpproxy status [HOST]
+  jumpproxy list
+  jumpproxy help [COMMAND]
+
+Commands:
+  add          Register a host and connect immediately.
+  modify       Change an existing host and reconnect it (alias: update).
+  remove       Stop and delete a registered host (aliases: delete, rm).
+  defaults     View or change default remote/local ports.
+  enable       Enable all hosts, or one specified host.
+  disable      Disable all hosts, or one specified host.
+  restart      Restart all hosts, or one specified host.
+  on/off       Short aliases for global enable/disable.
+  status/list  Inspect registered hosts and launchd state.
+
+Run "jumpproxy help COMMAND" for command-specific help.
+EOF
+}
+
+show_help() {
+    case "${1:-}" in
+        add)
+            /bin/cat <<'EOF'
+Usage: jumpproxy add HOST [OPTIONS]
+
+Register HOST, create its LaunchAgent, and connect immediately.
+
+Options:
+  --user USER          SSH user (default: root)
+  --remote-port PORT   Port opened on the remote server
+  --local-port PORT    Local proxy port forwarded to the server
+
+Omitted ports come from "jumpproxy defaults".
+EOF
+            ;;
+        modify|update)
+            /bin/cat <<'EOF'
+Usage: jumpproxy modify HOST [OPTIONS]
+
+Change an existing registration, rebuild its LaunchAgent, and reconnect.
+Unspecified values retain their current settings.
+
+Options:
+  --user USER
+  --remote-port PORT
+  --local-port PORT
+EOF
+            ;;
+        defaults)
+            /bin/cat <<'EOF'
+Usage:
+  jumpproxy defaults
+  jumpproxy defaults [--remote-port PORT] [--local-port PORT]
+  jumpproxy defaults --reset
+
+With no options, print the current defaults. Changes apply to future "add"
+commands whose corresponding port option is omitted. Existing hosts are not
+changed; use "jumpproxy modify HOST" for those.
+EOF
+            ;;
+        remove|delete|rm)
+            /bin/cat <<'EOF'
+Usage: jumpproxy remove HOST
+
+Disable HOST, terminate its managed SSH/cloudflared process tree, and remove
+its LaunchAgent and registration.
+EOF
+            ;;
+        enable|disable|restart|status)
+            /usr/bin/printf 'Usage: jumpproxy %s [HOST]\n\n' "$1"
+            /bin/echo "Without HOST, the command applies to every registered proxy."
+            ;;
+        list)
+            /bin/echo "Usage: jumpproxy list"
+            ;;
+        ''|help|-h|--help)
+            show_general_help
+            ;;
+        *)
+            /bin/echo "unknown help topic: $1" >&2
+            show_general_help >&2
+            return 2
+            ;;
+    esac
+}
+
+ensure_dirs() {
+    /bin/mkdir -p "$AGENT_DIR" "$HOST_DIR" "$STATE_DIR" "$LOG_DIR"
+}
+
+write_defaults() {
+    default_remote_port="$1"
+    default_local_port="$2"
+    temp_defaults=$(/usr/bin/mktemp "$CONFIG_ROOT/.defaults.XXXXXX")
+    /bin/chmod 600 "$temp_defaults"
+    {
+        /usr/bin/printf "DEFAULT_REMOTE_PORT='%s'\n" "$default_remote_port"
+        /usr/bin/printf "DEFAULT_LOCAL_PORT='%s'\n" "$default_local_port"
+    } > "$temp_defaults"
+    /bin/mv -f "$temp_defaults" "$DEFAULTS_FILE"
+}
+
+ensure_defaults() {
+    if test ! -r "$DEFAULTS_FILE"; then
+        write_defaults "$BUILTIN_REMOTE_PORT" "$BUILTIN_LOCAL_PORT"
+    fi
+}
+
+load_defaults() {
+    DEFAULT_REMOTE_PORT="$BUILTIN_REMOTE_PORT"
+    DEFAULT_LOCAL_PORT="$BUILTIN_LOCAL_PORT"
+    if test -r "$DEFAULTS_FILE"; then
+        . "$DEFAULTS_FILE"
+    fi
+    validate_port "$DEFAULT_REMOTE_PORT"
+    validate_port "$DEFAULT_LOCAL_PORT"
+}
+
+configure_defaults() {
+    load_defaults
+    if test "$#" -eq 0; then
+        /usr/bin/printf 'remote_port=%s\nlocal_port=%s\n' "$DEFAULT_REMOTE_PORT" "$DEFAULT_LOCAL_PORT"
+        return 0
+    fi
+
+    while test "$#" -gt 0; do
+        case "$1" in
+            --remote-port)
+                test "$#" -ge 2 || { /bin/echo "--remote-port requires a value" >&2; return 2; }
+                DEFAULT_REMOTE_PORT="$2"; shift 2
+                ;;
+            --local-port)
+                test "$#" -ge 2 || { /bin/echo "--local-port requires a value" >&2; return 2; }
+                DEFAULT_LOCAL_PORT="$2"; shift 2
+                ;;
+            --reset)
+                test "$#" -eq 1 || { /bin/echo "--reset cannot be combined with other options" >&2; return 2; }
+                DEFAULT_REMOTE_PORT="$BUILTIN_REMOTE_PORT"
+                DEFAULT_LOCAL_PORT="$BUILTIN_LOCAL_PORT"
+                shift
+                ;;
+            -h|--help)
+                show_help defaults
+                return 0
+                ;;
+            *)
+                /bin/echo "unknown defaults option: $1" >&2
+                return 2
+                ;;
+        esac
+    done
+
+    validate_port "$DEFAULT_REMOTE_PORT"
+    validate_port "$DEFAULT_LOCAL_PORT"
+    write_defaults "$DEFAULT_REMOTE_PORT" "$DEFAULT_LOCAL_PORT"
+    /usr/bin/printf 'defaults updated: remote_port=%s local_port=%s\n' \
+        "$DEFAULT_REMOTE_PORT" "$DEFAULT_LOCAL_PORT"
+}
+
+normalize_host() {
+    /usr/bin/printf '%s' "$1" | /usr/bin/tr '[:upper:]' '[:lower:]'
+}
+
+validate_host() {
+    case "$1" in
+        ''|.*|*.|*..*|*[!A-Za-z0-9.-]*)
+            /bin/echo "invalid hostname: $1" >&2
+            return 1
+            ;;
+    esac
+}
+
+validate_user() {
+    case "$1" in
+        ''|*[!A-Za-z0-9._-]*)
+            /bin/echo "invalid SSH user: $1" >&2
+            return 1
+            ;;
+    esac
+}
+
+validate_port() {
+    case "$1" in
+        ''|*[!0-9]*)
+            /bin/echo "invalid port: $1" >&2
+            return 1
+            ;;
+    esac
+    if test "$1" -lt 1 || test "$1" -gt 65535; then
+        /bin/echo "port out of range: $1" >&2
+        return 1
+    fi
+}
+
+label_for_host() {
+    /usr/bin/printf 'com.jumpproxy.tunnel.%s' "$1"
+}
+
+config_for_host() {
+    /usr/bin/printf '%s/%s.conf' "$HOST_DIR" "$1"
+}
+
+plist_for_host() {
+    /usr/bin/printf '%s/%s.plist' "$AGENT_DIR" "$(label_for_host "$1")"
+}
+
+xml_escape() {
+    /usr/bin/printf '%s' "$1" | /usr/bin/sed \
+        -e 's/&/\&amp;/g' \
+        -e 's/</\&lt;/g' \
+        -e 's/>/\&gt;/g' \
+        -e 's/"/\&quot;/g' \
+        -e "s/'/\&apos;/g"
+}
+
+is_loaded() {
+    /bin/launchctl print "$DOMAIN/$1" >/dev/null 2>&1
+}
+
+is_disabled() {
+    /bin/launchctl print-disabled "$DOMAIN" 2>/dev/null |
+        /usr/bin/awk -v target="\"$1\"" '
+            $1 == target && ($3 == "disabled" || $3 == "true") { found = 1 }
+            END { exit !found }
+        '
+}
+
+job_pid() {
+    /bin/launchctl print "$DOMAIN/$1" 2>/dev/null |
+        /usr/bin/awk '$1 == "pid" && $2 == "=" { print $3; exit }'
+}
+
+collect_process_tree() {
+    parent_pid="$1"
+    for child_pid in $(/usr/bin/pgrep -P "$parent_pid" 2>/dev/null || true); do
+        collect_process_tree "$child_pid"
+    done
+    /bin/echo "$parent_pid"
+}
+
+terminate_job() {
+    label="$1"
+    tracked_pids=""
+
+    if is_loaded "$label"; then
+        root_pid=$(job_pid "$label")
+        if test -n "$root_pid"; then
+            tracked_pids=$(collect_process_tree "$root_pid")
+        fi
+        /bin/launchctl bootout "$DOMAIN/$label" >/dev/null 2>&1 || true
+    fi
+
+    for process_pid in $tracked_pids; do
+        if /bin/kill -0 "$process_pid" 2>/dev/null; then
+            /bin/kill -TERM "$process_pid" 2>/dev/null || true
+        fi
+    done
+    if test -n "$tracked_pids"; then
+        /bin/sleep 1
+    fi
+    for process_pid in $tracked_pids; do
+        if /bin/kill -0 "$process_pid" 2>/dev/null; then
+            /bin/kill -KILL "$process_pid" 2>/dev/null || true
+        fi
+    done
+}
+
+disable_job() {
+    label="$1"
+    /bin/launchctl disable "$DOMAIN/$label"
+    terminate_job "$label"
+}
+
+enable_job() {
+    label="$1"
+    plist="$2"
+
+    if test ! -r "$plist"; then
+        /bin/echo "missing plist: $plist" >&2
+        return 1
+    fi
+
+    /bin/launchctl enable "$DOMAIN/$label"
+    if is_loaded "$label"; then
+        /bin/launchctl kickstart -k "$DOMAIN/$label" >/dev/null
+    else
+        /bin/launchctl bootstrap "$DOMAIN" "$plist" >/dev/null 2>&1 || true
+        if ! is_loaded "$label"; then
+            /bin/echo "failed to load: $label" >&2
+            return 1
+        fi
+        /bin/launchctl kickstart "$DOMAIN/$label" >/dev/null 2>&1 || true
+    fi
+}
+
+write_host_config() {
+    host="$1"
+    ssh_user="$2"
+    remote_port="$3"
+    local_port="$4"
+    config=$(config_for_host "$host")
+    temp_config=$(/usr/bin/mktemp "$HOST_DIR/.host.XXXXXX")
+    /bin/chmod 600 "$temp_config"
+    {
+        /usr/bin/printf "SSH_HOST='%s'\n" "$host"
+        /usr/bin/printf "SSH_USER='%s'\n" "$ssh_user"
+        /usr/bin/printf "REMOTE_PORT='%s'\n" "$remote_port"
+        /usr/bin/printf "LOCAL_PORT='%s'\n" "$local_port"
+    } > "$temp_config"
+    /bin/mv -f "$temp_config" "$config"
+}
+
+load_host_config() {
+    requested_host="$1"
+    config=$(config_for_host "$requested_host")
+    if test ! -r "$config"; then
+        /bin/echo "host is not registered: $requested_host" >&2
+        return 1
+    fi
+
+    SSH_HOST=""
+    SSH_USER=""
+    REMOTE_PORT=""
+    LOCAL_PORT=""
+    # Files are created by write_host_config after strict value validation.
+    . "$config"
+    validate_host "$SSH_HOST"
+    validate_user "$SSH_USER"
+    validate_port "$REMOTE_PORT"
+    validate_port "$LOCAL_PORT"
+    if test "$SSH_HOST" != "$requested_host"; then
+        /bin/echo "hostname mismatch in $config" >&2
+        return 1
+    fi
+}
+
+write_tunnel_plist() {
+    host="$1"
+    ssh_user="$2"
+    remote_port="$3"
+    local_port="$4"
+    label=$(label_for_host "$host")
+    plist=$(plist_for_host "$host")
+    temp_plist=$(/usr/bin/mktemp "$AGENT_DIR/.jumpproxy.XXXXXX")
+    runner_xml=$(xml_escape "$TUNNEL_RUNNER")
+    log_xml=$(xml_escape "$LOG_DIR/$host.log")
+    error_log_xml=$(xml_escape "$LOG_DIR/$host.err.log")
+
+    /bin/cat > "$temp_plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$label</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$runner_xml</string>
+        <string>$host</string>
+        <string>$ssh_user</string>
+        <string>$remote_port</string>
+        <string>$local_port</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>$log_xml</string>
+    <key>StandardErrorPath</key>
+    <string>$error_log_xml</string>
+</dict>
+</plist>
+EOF
+    /usr/bin/plutil -lint "$temp_plist" >/dev/null
+    /bin/chmod 644 "$temp_plist"
+    /bin/mv -f "$temp_plist" "$plist"
+}
+
+write_healthcheck_plist() {
+    ensure_dirs
+    temp_plist=$(/usr/bin/mktemp "$AGENT_DIR/.jumpproxy-health.XXXXXX")
+    runner_xml=$(xml_escape "$HEALTHCHECK_RUNNER")
+    log_xml=$(xml_escape "$LOG_DIR/healthcheck.log")
+    error_log_xml=$(xml_escape "$LOG_DIR/healthcheck.err.log")
+
+    /bin/cat > "$temp_plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$HEALTHCHECK_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$runner_xml</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>$log_xml</string>
+    <key>StandardErrorPath</key>
+    <string>$error_log_xml</string>
+</dict>
+</plist>
+EOF
+    /usr/bin/plutil -lint "$temp_plist" >/dev/null
+    /bin/chmod 644 "$temp_plist"
+    /bin/mv -f "$temp_plist" "$HEALTHCHECK_PLIST"
+}
+
+registered_hosts() {
+    for config in "$HOST_DIR"/*.conf; do
+        test -e "$config" || continue
+        basename=${config##*/}
+        /usr/bin/printf '%s\n' "${basename%.conf}"
+    done
+}
+
+enable_healthcheck() {
+    if test ! -r "$HEALTHCHECK_PLIST"; then
+        write_healthcheck_plist
+    fi
+    enable_job "$HEALTHCHECK_LABEL" "$HEALTHCHECK_PLIST"
+}
+
+add_host() {
+    if test "$#" -lt 1; then
+        show_help add >&2
+        return 2
+    fi
+    host=$(normalize_host "$1")
+    shift
+    load_defaults
+    ssh_user="root"
+    remote_port="$DEFAULT_REMOTE_PORT"
+    local_port="$DEFAULT_LOCAL_PORT"
+
+    while test "$#" -gt 0; do
+        case "$1" in
+            --user)
+                test "$#" -ge 2 || { /bin/echo "--user requires a value" >&2; return 2; }
+                ssh_user="$2"; shift 2
+                ;;
+            --remote-port)
+                test "$#" -ge 2 || { /bin/echo "--remote-port requires a value" >&2; return 2; }
+                remote_port="$2"; shift 2
+                ;;
+            --local-port)
+                test "$#" -ge 2 || { /bin/echo "--local-port requires a value" >&2; return 2; }
+                local_port="$2"; shift 2
+                ;;
+            -h|--help)
+                show_help add
+                return 0
+                ;;
+            *)
+                /bin/echo "unknown option: $1" >&2
+                return 2
+                ;;
+        esac
+    done
+
+    validate_host "$host"
+    validate_user "$ssh_user"
+    validate_port "$remote_port"
+    validate_port "$local_port"
+    ensure_dirs
+
+    label=$(label_for_host "$host")
+    plist=$(plist_for_host "$host")
+    if is_loaded "$label"; then
+        terminate_job "$label"
+    fi
+    write_host_config "$host" "$ssh_user" "$remote_port" "$local_port"
+    write_tunnel_plist "$host" "$ssh_user" "$remote_port" "$local_port"
+    enable_job "$label" "$plist"
+    enable_healthcheck
+    /bin/echo "added and connecting: $ssh_user@$host (remote $remote_port -> local $local_port)"
+}
+
+modify_host() {
+    if test "$#" -lt 1; then
+        show_help modify >&2
+        return 2
+    fi
+    host=$(normalize_host "$1")
+    shift
+    validate_host "$host"
+    load_host_config "$host"
+    ssh_user="$SSH_USER"
+    remote_port="$REMOTE_PORT"
+    local_port="$LOCAL_PORT"
+
+    while test "$#" -gt 0; do
+        case "$1" in
+            --user)
+                test "$#" -ge 2 || { /bin/echo "--user requires a value" >&2; return 2; }
+                ssh_user="$2"; shift 2
+                ;;
+            --remote-port)
+                test "$#" -ge 2 || { /bin/echo "--remote-port requires a value" >&2; return 2; }
+                remote_port="$2"; shift 2
+                ;;
+            --local-port)
+                test "$#" -ge 2 || { /bin/echo "--local-port requires a value" >&2; return 2; }
+                local_port="$2"; shift 2
+                ;;
+            -h|--help)
+                show_help modify
+                return 0
+                ;;
+            *)
+                /bin/echo "unknown option: $1" >&2
+                return 2
+                ;;
+        esac
+    done
+
+    validate_user "$ssh_user"
+    validate_port "$remote_port"
+    validate_port "$local_port"
+    label=$(label_for_host "$host")
+    plist=$(plist_for_host "$host")
+    terminate_job "$label"
+    write_host_config "$host" "$ssh_user" "$remote_port" "$local_port"
+    write_tunnel_plist "$host" "$ssh_user" "$remote_port" "$local_port"
+    enable_job "$label" "$plist"
+    enable_healthcheck
+    /bin/echo "updated and reconnecting: $ssh_user@$host (remote $remote_port -> local $local_port)"
+}
+
+remove_host() {
+    host=$(normalize_host "$1")
+    validate_host "$host"
+    load_host_config "$host"
+    label=$(label_for_host "$host")
+    plist=$(plist_for_host "$host")
+    config=$(config_for_host "$host")
+
+    disable_job "$label"
+    /bin/rm -f "$plist" "$config"
+    /bin/rm -f "$STATE_DIR/$label.failures"
+    /bin/echo "removed: $host"
+}
+
+enable_host() {
+    host=$(normalize_host "$1")
+    validate_host "$host"
+    load_host_config "$host"
+    plist=$(plist_for_host "$host")
+    if test ! -r "$plist"; then
+        write_tunnel_plist "$SSH_HOST" "$SSH_USER" "$REMOTE_PORT" "$LOCAL_PORT"
+    fi
+    enable_job "$(label_for_host "$host")" "$plist"
+    /bin/echo "enabled and connecting: $host"
+}
+
+disable_host() {
+    host=$(normalize_host "$1")
+    validate_host "$host"
+    load_host_config "$host"
+    disable_job "$(label_for_host "$host")"
+    /bin/echo "disabled: $host"
+}
+
+enable_all() {
+    result=0
+    for host in $(registered_hosts); do
+        enable_host "$host" || result=1
+    done
+    enable_healthcheck || result=1
+    return "$result"
+}
+
+disable_all() {
+    disable_job "$HEALTHCHECK_LABEL"
+    /bin/echo "disabled: healthcheck"
+    for host in $(registered_hosts); do
+        disable_host "$host"
+    done
+}
+
+status_job() {
+    label="$1"
+    override="enabled"
+    if is_disabled "$label"; then
+        override="disabled"
+    fi
+
+    if is_loaded "$label"; then
+        state=$(/bin/launchctl print "$DOMAIN/$label" 2>/dev/null |
+            /usr/bin/awk '$1 == "state" && $2 == "=" {
+                $1 = ""; $2 = ""; sub(/^[[:space:]]+/, ""); print; exit
+            }')
+        pid=$(job_pid "$label")
+        if test -n "$pid"; then
+            /usr/bin/printf '%-9s %-11s pid=%-7s %s\n' "$override" "${state:-loaded}" "$pid" "$label"
+        else
+            /usr/bin/printf '%-9s %-11s %-11s %s\n' "$override" "${state:-loaded}" "pid=-" "$label"
+        fi
+    else
+        /usr/bin/printf '%-9s %-11s %-11s %s\n' "$override" "unloaded" "pid=-" "$label"
+    fi
+}
+
+status_host() {
+    host=$(normalize_host "$1")
+    validate_host "$host"
+    load_host_config "$host"
+    if /usr/bin/nc -z -w 2 127.0.0.1 "$LOCAL_PORT" >/dev/null 2>&1; then
+        local_state="listening"
+    else
+        local_state="unavailable"
+    fi
+    /usr/bin/printf '%s: %s@%s, remote %s -> local %s (%s)\n' \
+        "$host" "$SSH_USER" "$SSH_HOST" "$REMOTE_PORT" "$LOCAL_PORT" "$local_state"
+    status_job "$(label_for_host "$host")"
+}
+
+show_status() {
+    if test "$#" -gt 0; then
+        status_host "$1"
+        return
+    fi
+    for host in $(registered_hosts); do
+        status_host "$host"
+    done
+    status_job "$HEALTHCHECK_LABEL"
+}
+
+list_hosts() {
+    /usr/bin/printf '%-38s %-12s %-12s %-10s\n' "HOST" "USER" "REMOTE_PORT" "LOCAL_PORT"
+    for host in $(registered_hosts); do
+        load_host_config "$host" || continue
+        /usr/bin/printf '%-38s %-12s %-12s %-10s\n' "$SSH_HOST" "$SSH_USER" "$REMOTE_PORT" "$LOCAL_PORT"
+    done
+}
+
+ensure_dirs
+ensure_defaults
+
+command_name="${1:-}"
+case "$command_name" in
+    add)
+        shift
+        if test "${1:-}" = "-h" || test "${1:-}" = "--help"; then
+            show_help add
+        else
+            add_host "$@"
+        fi
+        ;;
+    modify|update)
+        shift
+        if test "${1:-}" = "-h" || test "${1:-}" = "--help"; then
+            show_help modify
+        else
+            modify_host "$@"
+        fi
+        ;;
+    remove|delete|rm)
+        shift
+        if test "${1:-}" = "-h" || test "${1:-}" = "--help"; then
+            show_help remove
+            exit 0
+        fi
+        test "$#" -eq 1 || { show_help remove >&2; exit 2; }
+        remove_host "$1"
+        ;;
+    defaults)
+        shift
+        configure_defaults "$@"
+        ;;
+    enable)
+        shift
+        test "$#" -le 1 || { show_help enable >&2; exit 2; }
+        if test "$#" -eq 0; then enable_all; else enable_host "$1"; fi
+        ;;
+    on)
+        shift
+        test "$#" -eq 0 || { show_general_help >&2; exit 2; }
+        enable_all
+        ;;
+    disable)
+        shift
+        test "$#" -le 1 || { show_help disable >&2; exit 2; }
+        if test "$#" -eq 0; then disable_all; else disable_host "$1"; fi
+        ;;
+    off)
+        shift
+        test "$#" -eq 0 || { show_general_help >&2; exit 2; }
+        disable_all
+        ;;
+    restart)
+        shift
+        test "$#" -le 1 || { show_help restart >&2; exit 2; }
+        if test "$#" -eq 0; then
+            disable_all
+            enable_all
+        else
+            disable_host "$1"
+            enable_host "$1"
+        fi
+        ;;
+    status)
+        shift
+        test "$#" -le 1 || { show_help status >&2; exit 2; }
+        show_status "$@"
+        ;;
+    list)
+        shift
+        test "$#" -eq 0 || { show_help list >&2; exit 2; }
+        list_hosts
+        ;;
+    _install-healthcheck)
+        write_healthcheck_plist
+        ;;
+    help)
+        shift
+        test "$#" -le 1 || { show_general_help >&2; exit 2; }
+        show_help "${1:-}"
+        ;;
+    -h|--help|'')
+        show_general_help
+        ;;
+    *)
+        /bin/echo "unknown command: $command_name" >&2
+        show_general_help >&2
+        exit 2
+        ;;
+esac

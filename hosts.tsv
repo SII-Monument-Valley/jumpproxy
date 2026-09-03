@@ -1,0 +1,5 @@
+# host	user	remote_port	local_port
+gateway.sii.sh.cn	root	1080	7897
+ssh.deeptoken.site	root	1080	7897
+swq.sii.sh.cn	root	1080	7897
+worldmodel-gateway.sii.sh.cn	root	1080	7897
