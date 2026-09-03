@@ -21,6 +21,11 @@ All connection settings—including `HostName`, `User`, `Port`, `IdentityFile`,
 Cloudflare Access, then `cloudflared` is naturally required by the config; the
 jumpproxy service itself neither locates nor invokes it directly.
 
+Tunnel jobs disable SSH connection multiplexing for their own process so that
+stopping one managed tunnel never terminates or takes ownership of an unrelated
+interactive SSH/Codex control connection. All routing and authentication
+settings still come from the selected SSH config.
+
 Run:
 
 ```sh

@@ -37,5 +37,8 @@ exec /usr/bin/ssh \
     -o ServerAliveCountMax=2 \
     -o ConnectTimeout=20 \
     -o StrictHostKeyChecking=accept-new \
+    -o ControlMaster=no \
+    -o ControlPath=none \
+    -o ControlPersist=no \
     -R "127.0.0.1:$REMOTE_PORT:127.0.0.1:$LOCAL_PORT" \
     "$TARGET"
