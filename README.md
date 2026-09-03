@@ -32,8 +32,10 @@ Run:
 ./install.sh
 ```
 
-The hosts listed in `hosts.tsv` are installed and connected immediately. To
-install the manager without that list, run `./install.sh --no-hosts`.
+Optional bootstrap hosts listed in `hosts.tsv` are installed and connected
+immediately. The distributed file contains no machine-specific hosts. Register
+connections afterward with `jumpproxy add HOST`, or run
+`./install.sh --no-hosts` to explicitly skip the bootstrap list.
 
 ## Commands
 
